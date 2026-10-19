@@ -1,0 +1,3 @@
+stt_s,llm_s,tts_s,total_s,fallback,transcript
+1.71,0.2,9.53,11.44,True,"Hello, what is the capital of France, and can you tell me one interesting fact a"
+1.59,0.73,1.86,4.19,False,"Hello, what is the capital of France, and can you tell me one interesting fact a"

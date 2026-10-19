@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Assistant</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --accent:#6366f1; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; justify-content:center; padding:24px; }
+  main { width:100%; max-width:640px; }
+  h1 { margin:0 0 4px; }
+  p.sub { color:var(--muted); margin-top:0; }
+  .card { background:var(--card); border-radius:14px; padding:20px; margin-bottom:16px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:12px 18px; font-size:16px; cursor:pointer; }
+  button.rec { background:var(--bad); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .label { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.05em; margin-bottom:4px; }
+  .box { background:#0b1220; border-radius:8px; padding:10px 12px; min-height:42px; white-space:pre-wrap; }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:4px 0; } td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  .bar { height:8px; background:var(--accent); border-radius:4px; }
+  #status { color:var(--muted); }
+  audio { width:100%; margin-top:10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Voice Assistant</h1>
+  <p class="sub">Speech-to-Text → LLM → Text-to-Speech (Groq Whisper + Llama + edge-tts, free)</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="recBtn">● Start recording</button>
+      <span style="color:var(--muted)">or</span>
+      <input type="file" id="file" accept="audio/*">
+      <button id="clearBtn" style="background:#334155">Reset chat</button>
+    </div>
+    <p id="status">Ready.</p>
+  </div>
+
+  <div class="card" id="result" style="display:none">
+    <div class="label">You said</div><div class="box" id="transcript"></div>
+    <div class="label" style="margin-top:14px">Assistant</div><div class="box" id="reply"></div>
+    <audio id="player" controls></audio>
+    <div class="label" style="margin-top:14px">Latency (seconds)</div>
+    <table id="timings"></table>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let recorder, chunks = [];
+function setStatus(t){ $("status").textContent = t; }
+
+// Convert any browser-decodable audio blob to 16 kHz mono WAV (Gemini accepts WAV reliably)
+async function toWav(blob) {
+  const buf = await blob.arrayBuffer();
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await ctx.decodeAudioData(buf);
+  ctx.close();
+  const rate = 16000;
+  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * rate), rate);
+  const src = off.createBufferSource();
+  src.buffer = decoded; src.connect(off.destination); src.start();
+  const pcm = (await off.startRendering()).getChannelData(0);
+  const out = new DataView(new ArrayBuffer(44 + pcm.length * 2));
+  const w = (o, s) => [...s].forEach((c, i) => out.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); out.setUint32(4, 36 + pcm.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+  out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true);
+  out.setUint16(32, 2, true); out.setUint16(34, 16, true); w(36, "data");
+  out.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([out], { type: "audio/wav" });
+}
+
+$("recBtn").onclick = async () => {
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      $("recBtn").textContent = "● Start recording";
+      $("recBtn").classList.remove("rec");
+      send(new Blob(chunks, { type: recorder.mimeType }), "recording.webm");
+    };
+    recorder.start();
+    $("recBtn").textContent = "■ Stop & send";
+    $("recBtn").classList.add("rec");
+    setStatus("Recording… speak now.");
+  } catch (e) {
+    setStatus("Microphone unavailable (" + e.message + "). Use file upload instead.");
+  }
+};
+
+$("file").onchange = e => { const f = e.target.files[0]; if (f) send(f, f.name); e.target.value = ""; };
+$("clearBtn").onclick = async () => { await fetch("/api/reset", {method:"POST"}); setStatus("Conversation reset."); };
+
+async function send(blob, name) {
+  setStatus("Processing (STT → LLM → TTS)…");
+  $("recBtn").disabled = true;
+  try {
+    try { blob = await toWav(blob); name = name.replace(/\.[^.]+$/, "") + ".wav"; }
+    catch (e) { /* keep original format if the browser can't decode it */ }
+    const fd = new FormData();
+    fd.append("audio", blob, name);
+    const r = await fetch("/api/voice", { method: "POST", body: fd });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    show(d);
+    setStatus(d.fallback ? "Audio was unclear or an error occurred — fallback reply used." : "Done.");
+    if (d.error) setStatus("Note: " + d.error);
+  } catch (e) {
+    setStatus("Error: " + e.message);
+  } finally { $("recBtn").disabled = false; }
+}
+
+function show(d) {
+  $("result").style.display = "block";
+  $("transcript").textContent = d.transcript || "(nothing recognised)";
+  $("reply").textContent = d.reply;
+  if (d.audio_url) { $("player").src = d.audio_url; $("player").play().catch(()=>{}); }
+  const t = d.timings, max = Math.max(t.stt, t.llm, t.tts, 0.01);
+  const slow = Object.entries({stt:t.stt, llm:t.llm, tts:t.tts}).sort((a,b)=>b[1]-a[1])[0][0];
+  $("timings").innerHTML = ["stt","llm","tts"].map(k =>
+    `<tr><td>${k.toUpperCase()}${k===slow?" ← bottleneck":""}</td><td>${t[k]}s</td></tr>
+     <tr><td colspan="2"><div class="bar" style="width:${t[k]/max*100}%"></div></td></tr>`).join("")
+    + `<tr><td><b>TOTAL</b></td><td><b>${t.total}s</b></td></tr>`;
+}
+</script>
+</body>
+</html>
